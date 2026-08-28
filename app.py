@@ -2,8 +2,8 @@
 Swing Trading Breakout Scanner — Nifty 500
 --------------------------------------------
 Weekly-trend-based breakout scanner with volume confirmation.
-Run locally with:  streamlit run app.py
-Deploy free on Streamlit Community Cloud (see README.md).
+Run locally:   py -m streamlit run app.py
+Deploy free:   Streamlit Community Cloud (see README.md)
 """
 
 import io
@@ -14,20 +14,25 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+from zoneinfo import ZoneInfo
 
-st.set_page_config(page_title="Swing Breakout Scanner", page_icon="\U0001F4CA", layout="wide")
+IST = ZoneInfo("Asia/Kolkata")
+
+st.set_page_config(
+    page_title="Swing Breakout Scanner",
+    page_icon="📈",
+    layout="wide",
+)
 
 # ---------------------------------------------------------------------------
-# TERMINAL THEME — fonts, header banner, ticker-board summary, table styling
+# THEME
 # ---------------------------------------------------------------------------
 
 CUSTOM_CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
 
-html, body, [class*="css"]  { font-family: 'Space Grotesk', sans-serif; }
-
-/* Numbers / data everywhere in monospace for a terminal feel */
+html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
 [data-testid="stDataFrame"] * { font-family: 'JetBrains Mono', monospace !important; }
 
 .app-header {
@@ -54,7 +59,6 @@ html, body, [class*="css"]  { font-family: 'Space Grotesk', sans-serif; }
     letter-spacing: 0.2px;
 }
 
-/* Ticker-board summary strip */
 .ticker-board {
     display: flex;
     gap: 1px;
@@ -84,9 +88,8 @@ html, body, [class*="css"]  { font-family: 'Space Grotesk', sans-serif; }
     color: #E8E6DF;
 }
 .ticker-cell .value.accent { color: #C89B3C; }
-.ticker-cell .value.bull { color: #4A9B7F; }
+.ticker-cell .value.bull   { color: #4A9B7F; }
 
-/* Section labels styled like a board eyebrow */
 .section-label {
     font-family: 'JetBrains Mono', monospace;
     font-size: 0.72rem;
@@ -104,7 +107,6 @@ html, body, [class*="css"]  { font-family: 'Space Grotesk', sans-serif; }
     margin-bottom: 14px;
 }
 
-/* Buttons */
 div.stButton > button {
     font-family: 'Space Grotesk', sans-serif;
     font-weight: 700;
@@ -123,69 +125,47 @@ div.stButton > button:hover {
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# 1. NIFTY 500 LIST
+# 1. SYMBOL LISTS
 # ---------------------------------------------------------------------------
 
-NSE_URL = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+NSE_URL       = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+NSE_FULL_URL  = "https://archives.nseindia.com/content/equity/EQUITY_L.csv"
+NSE_HEADERS   = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def _nse_session():
+    s = requests.Session()
+    try:
+        s.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)
+    except Exception:
+        pass
+    return s
+
 
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def fetch_nifty500_symbols():
-    """Try to pull the official Nifty 500 constituent list from NSE.
-    Falls back to None if blocked (NSE sometimes rejects scripted requests)."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
     try:
-        session = requests.Session()
-        # NSE requires a warm-up hit to the homepage first to set cookies
-        session.get("https://www.nseindia.com", headers=headers, timeout=10)
-        resp = session.get(NSE_URL, headers=headers, timeout=10)
+        resp = _nse_session().get(NSE_URL, headers=NSE_HEADERS, timeout=10)
         resp.raise_for_status()
         df = pd.read_csv(io.StringIO(resp.text))
-        symbols = df["Symbol"].astype(str).str.strip().tolist()
-        return [s + ".NS" for s in symbols]
+        return [s.strip() + ".NS" for s in df["Symbol"].astype(str).tolist()]
     except Exception:
         return None
 
 
-def get_symbol_list(uploaded_file):
-    """Priority: user-uploaded CSV > live NSE fetch > manual paste box."""
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-        col = "Symbol" if "Symbol" in df.columns else df.columns[0]
-        syms = df[col].astype(str).str.strip().tolist()
-        return [s if s.endswith(".NS") else s + ".NS" for s in syms]
-
-    live = fetch_nifty500_symbols()
-    if live:
-        return live
-
-    return None
-
-
-# --- Top-N by market cap (broader universe than Nifty 500) ---
-
-NSE_FULL_EQUITY_URL = "https://archives.nseindia.com/content/equity/EQUITY_L.csv"
-
-
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def fetch_full_nse_equity_list():
-    """All NSE-listed equities (~2000), used as the candidate pool for market-cap ranking."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
     try:
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=10)
-        resp = session.get(NSE_FULL_EQUITY_URL, headers=headers, timeout=10)
+        resp = _nse_session().get(NSE_FULL_URL, headers=NSE_HEADERS, timeout=10)
         resp.raise_for_status()
         df = pd.read_csv(io.StringIO(resp.text))
-        symbols = df["SYMBOL"].astype(str).str.strip().tolist()
-        return [s + ".NS" for s in symbols]
+        return [s.strip() + ".NS" for s in df["SYMBOL"].astype(str).tolist()]
     except Exception:
         return None
 
@@ -193,7 +173,7 @@ def fetch_full_nse_equity_list():
 def _fetch_market_cap(ticker):
     try:
         fi = yf.Ticker(ticker).fast_info
-        mc = fi.get("market_cap") or fi.get("marketCap")
+        mc = getattr(fi, "market_cap", None) or getattr(fi, "marketCap", None)
         return ticker, mc
     except Exception:
         return ticker, None
@@ -201,163 +181,287 @@ def _fetch_market_cap(ticker):
 
 @st.cache_data(ttl=60 * 60 * 24 * 7, show_spinner=False)
 def rank_by_market_cap(symbols, top_n):
-    """Fetch market cap for each symbol (threaded, since it's one network call per
-    ticker) and return the top_n. Cached for 7 days — this is the slow part."""
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-        futures = {ex.submit(_fetch_market_cap, s): s for s in symbols}
-        for fut in concurrent.futures.as_completed(futures):
-            t, mc = fut.result()
+        for t, mc in ex.map(_fetch_market_cap, symbols):
             if mc:
                 results[t] = mc
     ranked = sorted(results.items(), key=lambda x: x[1], reverse=True)
     return [t for t, _ in ranked[:top_n]]
 
 
-def get_topn_marketcap_list(uploaded_file, top_n, progress_placeholder=None):
-    """Priority: user-uploaded ranked CSV > live NSE full list + yfinance market-cap ranking."""
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-        col = "Symbol" if "Symbol" in df.columns else df.columns[0]
-        syms = df[col].astype(str).str.strip().tolist()
-        return [s if s.endswith(".NS") else s + ".NS" for s in syms][:top_n]
-
-    pool = fetch_full_nse_equity_list()
-    if not pool:
-        return None
-
-    if progress_placeholder:
-        progress_placeholder.info(
-            f"Ranking {len(pool)} NSE-listed stocks by market cap — this can take "
-            f"several minutes on the first run, then it's cached for 7 days."
-        )
-    return rank_by_market_cap(pool, top_n)
+def symbols_from_upload(uploaded_file):
+    df = pd.read_csv(uploaded_file)
+    col = "Symbol" if "Symbol" in df.columns else df.columns[0]
+    syms = df[col].astype(str).str.strip().tolist()
+    return [s if s.endswith(".NS") else s + ".NS" for s in syms]
 
 
 # ---------------------------------------------------------------------------
-# 2. DATA DOWNLOAD
+# 2. DATA DOWNLOAD — robust multi-ticker extraction
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
-def download_data(tickers, interval, period):
-    """Bulk-download OHLCV for a list of tickers. Returns a dict {ticker: df}."""
+def download_data(tickers: tuple, interval: str, period: str) -> dict:
+    """
+    Bulk-download OHLCV. Returns dict {ticker: DataFrame}.
+    Handles both old (ticker-first) and new (price-first) yfinance MultiIndex layouts.
+    """
+    tickers = list(tickers)
     data = {}
     batch_size = 50
+
     for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i + batch_size]
+        batch = tickers[i : i + batch_size]
         try:
             raw = yf.download(
-                batch, period=period, interval=interval,
-                group_by="ticker", threads=True, progress=False, auto_adjust=False,
+                batch,
+                period=period,
+                interval=interval,
+                group_by="ticker",
+                threads=True,
+                progress=False,
+                auto_adjust=True,   # auto_adjust=True removes Adj Close noise
             )
         except Exception:
             continue
 
-        for t in batch:
-            try:
-                if len(batch) == 1:
-                    df = raw
-                else:
-                    df = raw[t]
-                df = df.dropna(how="all")
-                if not df.empty and len(df) > 25:
-                    data[t] = df
-            except Exception:
-                continue
+        if len(batch) == 1:
+            t = batch[0]
+            df = raw.dropna(how="all")
+            if not df.empty and len(df) > 10:
+                data[t] = df
+            continue
+
+        # Multi-ticker: yfinance ≥0.2.x returns columns as MultiIndex (Price, Ticker)
+        # Older versions return (Ticker, Price). Detect and handle both.
+        if isinstance(raw.columns, pd.MultiIndex):
+            top_level = raw.columns.get_level_values(0).unique().tolist()
+            # New layout: top level = price names (Open, High, …)
+            price_names = {"Open", "High", "Low", "Close", "Volume"}
+            if set(top_level[:5]) & price_names:
+                # columns are (Price, Ticker) → swap to get per-ticker slice
+                raw = raw.swaplevel(axis=1)
+            # Now columns are (Ticker, Price)
+            for t in batch:
+                try:
+                    df = raw[t].dropna(how="all")
+                    if not df.empty and len(df) > 10:
+                        data[t] = df
+                except KeyError:
+                    continue
+        else:
+            # Flat columns — single ticker fell through somehow
+            for t in batch:
+                try:
+                    df = raw.dropna(how="all")
+                    if not df.empty and len(df) > 10:
+                        data[t] = df
+                except Exception:
+                    continue
+
     return data
 
 
 # ---------------------------------------------------------------------------
-# 3. INDICATOR / CONDITION LOGIC
+# 3. INDICATOR HELPERS
 # ---------------------------------------------------------------------------
 
-def ema(series, span):
+def _ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 
-def evaluate_stock(symbol, daily, weekly, params):
-    """Returns a dict of computed metrics + pass/fail flags, or None if data insufficient."""
-    if daily is None or weekly is None:
-        return None
-    if len(daily) < 25 or len(weekly) < 56:
-        return None
+def _last_closed_weekly(weekly: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop the current in-progress week so partial candles don't skew results.
+    Works correctly whether the index is tz-aware or tz-naive.
+    """
+    now_ist = pd.Timestamp.now(tz=IST)
+    this_monday_ist = (now_ist - pd.Timedelta(days=now_ist.weekday())).normalize()
 
-    # Use the last FULLY CLOSED week. If today falls inside the current week
-    # (Mon–Fri before the week ends), the latest weekly bar from yfinance is
-    # still forming and its volume/close are incomplete — drop it so the
-    # scan works correctly on any day, not just Fri/Sat.
-    today = pd.Timestamp.now().normalize()
-    this_monday = today - pd.Timedelta(days=today.weekday())
+    idx = weekly.index
+    if idx.tzinfo is not None or (hasattr(idx, "tz") and idx.tz is not None):
+        this_monday = this_monday_ist. astimezone(idx.tz)
+    else:
+        this_monday = this_monday_ist.replace(tzinfo=None)
+
     if weekly.index[-1] >= this_monday:
         weekly = weekly.iloc[:-1]
-    if len(weekly) < 55:
+    return weekly
+
+
+def _last_closed_daily(daily: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop today's partial daily bar if the NSE market hasn't fully closed yet
+    (NSE closes 15:30 IST; add a 15-min buffer → 15:45 IST).
+    """
+    now_ist = pd.Timestamp.now(tz=IST)
+    market_close_ist = now_ist.normalize().replace(hour=15, minute=45)
+
+    idx = daily.index
+    if idx.tzinfo is not None or (hasattr(idx, "tz") and idx.tz is not None):
+        today_start = now_ist.normalize().astimezone(idx.tz)
+    else:
+        today_start = now_ist.normalize().replace(tzinfo=None)
+
+    if now_ist < market_close_ist and daily.index[-1] >= today_start:
+        daily = daily.iloc[:-1]
+    return daily
+
+
+# ---------------------------------------------------------------------------
+# 4. STOCK EVALUATION
+# ---------------------------------------------------------------------------
+
+def evaluate_stock(symbol: str, daily: pd.DataFrame, weekly: pd.DataFrame, params: dict):
+    """
+    Returns a metrics dict (with Pass Strict / Pass Watchlist flags),
+    or None if data is insufficient.
+    """
+    if daily is None or weekly is None:
         return None
 
-    d_close = daily["Close"]
-    d_open = daily["Open"]
-    d_vol = daily["Volume"]
-    w_close = weekly["Close"]
-    w_high = weekly["High"]
-    w_vol = weekly["Volume"]
+    # Remove partial candles
+    weekly = _last_closed_weekly(weekly)
+    daily  = _last_closed_daily(daily)
+
+    if len(daily) < 22 or len(weekly) < 55:
+        return None
 
     try:
+        d_close = daily["Close"].squeeze()
+        d_open  = daily["Open"].squeeze()
+        d_vol   = daily["Volume"].squeeze()
+        w_close = weekly["Close"].squeeze()
+        w_high  = weekly["High"].squeeze()
+        w_vol   = weekly["Volume"].squeeze()
+
+        # Sanity check — must be a Series after squeeze
+        for s in (d_close, d_open, d_vol, w_close, w_high, w_vol):
+            if not isinstance(s, pd.Series):
+                return None
+
         latest_close = float(d_close.iloc[-1])
-        latest_vol = float(d_vol.iloc[-1])
+        latest_vol   = float(d_vol.iloc[-1])
+
+        # Guard against NaN close
+        if np.isnan(latest_close) or latest_close <= 0:
+            return None
 
         # Weekly trend
-        w_ema20 = ema(w_close, 20)
-        w_ema50 = ema(w_close, 50)
-        weekly_trend_ok = (w_close.iloc[-1] > w_ema20.iloc[-1]) and (w_ema20.iloc[-1] > w_ema50.iloc[-1])
-        ema50_rising = w_ema50.iloc[-1] > w_ema50.iloc[-2]
+        w_ema20 = _ema(w_close, 20)
+        w_ema50 = _ema(w_close, 50)
+        weekly_trend_ok = (
+            float(w_close.iloc[-1]) > float(w_ema20.iloc[-1]) and
+            float(w_ema20.iloc[-1]) > float(w_ema50.iloc[-1])
+        )
+        ema50_rising = float(w_ema50.iloc[-1]) > float(w_ema50.iloc[-2])
 
-        # Daily compression (last 20 days, based on Open, matching original Chartink logic)
+        # Daily 20-day open compression
         last20_open = d_open.iloc[-20:]
-        compression_ratio = last20_open.max() / last20_open.min()
+        mn, mx = float(last20_open.min()), float(last20_open.max())
+        compression_ratio = mx / mn if mn > 0 else np.nan
 
-        # Near / at weekly breakout: compare latest weekly close to prior 20-week high (excluding current week)
-        prior_20w_high = w_high.iloc[-21:-1].max()
-        pct_from_high = (w_close.iloc[-1] / prior_20w_high - 1) * 100  # negative = below high
+        # Proximity to prior 20-week high (exclude current week)
+        prior_slice  = w_high.iloc[-21:-1]
+        prior_20w_hi = float(prior_slice.max())
+        pct_from_high = (float(w_close.iloc[-1]) / prior_20w_hi - 1) * 100 if prior_20w_hi > 0 else np.nan
 
-        # Weekly volume expansion
-        w_vol_avg20 = w_vol.iloc[-21:-1].mean()
-        vol_ratio = w_vol.iloc[-1] / w_vol_avg20 if w_vol_avg20 > 0 else np.nan
+        # Weekly volume expansion vs prior 20 weeks
+        vol_slice    = w_vol.iloc[-21:-1]
+        w_vol_avg20  = float(vol_slice.mean())
+        vol_ratio    = float(w_vol.iloc[-1]) / w_vol_avg20 if w_vol_avg20 > 0 else np.nan
 
-        # Extension above weekly EMA20 (avoid chasing)
-        pct_above_ema20 = (w_close.iloc[-1] / w_ema20.iloc[-1] - 1) * 100
+        # Extension above weekly EMA20
+        pct_above_ema20 = (float(w_close.iloc[-1]) / float(w_ema20.iloc[-1]) - 1) * 100
 
         row = {
-            "Symbol": symbol.replace(".NS", ""),
-            "Close": round(latest_close, 2),
-            "Weekly Trend OK": weekly_trend_ok,
-            "EMA50 Rising": ema50_rising,
-            "Compression (20d)": round((compression_ratio - 1) * 100, 2),
-            "% From 20W High": round(pct_from_high, 2),
-            "Weekly Vol Ratio": round(vol_ratio, 2) if not np.isnan(vol_ratio) else None,
+            "Symbol":               symbol.replace(".NS", ""),
+            "Close":                round(latest_close, 2),
+            "Weekly Trend OK":      weekly_trend_ok,
+            "EMA50 Rising":         ema50_rising,
+            "Compression (20d)":    round((compression_ratio - 1) * 100, 2) if not np.isnan(compression_ratio) else None,
+            "% From 20W High":      round(pct_from_high, 2) if not np.isnan(pct_from_high) else None,
+            "Weekly Vol Ratio":     round(vol_ratio, 2) if not np.isnan(vol_ratio) else None,
             "% Above Weekly EMA20": round(pct_above_ema20, 2),
-            "Daily Volume": int(latest_vol),
+            "Daily Volume":         int(latest_vol),
         }
 
-        # Pass flags for STRICT and WATCHLIST profiles
+        # Evaluate pass conditions for both profiles
         for label, p in [("Strict", params["strict"]), ("Watchlist", params["watchlist"])]:
+            vol_ok  = (row["Weekly Vol Ratio"] is not None and row["Weekly Vol Ratio"] >= p["vol_multiple"])
+            high_ok = (row["% From 20W High"] is not None and row["% From 20W High"] >= -p["near_high_pct"])
+            comp_ok = (row["Compression (20d)"] is not None and (row["Compression (20d)"] / 100 + 1) <= p["compression_band"])
             passes = (
-                latest_vol >= p["min_volume"]
+                latest_vol   >= p["min_volume"]
                 and latest_close >= p["min_price"]
                 and weekly_trend_ok
                 and (ema50_rising or not p["require_ema50_rising"])
-                and compression_ratio <= p["compression_band"]
-                and pct_from_high >= -p["near_high_pct"]
-                and (vol_ratio is not None and not np.isnan(vol_ratio) and vol_ratio >= p["vol_multiple"])
+                and comp_ok
+                and high_ok
+                and vol_ok
                 and pct_above_ema20 <= p["extension_cap"]
             )
             row[f"Pass {label}"] = passes
 
         return row
+
     except Exception:
         return None
 
 
 # ---------------------------------------------------------------------------
-# 4. UI
+# 5. TABLE STYLING — no matplotlib
+# ---------------------------------------------------------------------------
+
+def _color_vol(val):
+    try:
+        v = float(val)
+        if v >= 2.5:    return "background-color:#1a4d35; color:#E8E6DF"
+        elif v >= 2.0:  return "background-color:#1d5c3e; color:#E8E6DF"
+        elif v >= 1.5:  return "background-color:#236b48; color:#E8E6DF"
+        elif v >= 1.25: return "background-color:#2a7a52; color:#E8E6DF"
+        else:           return "background-color:#2a3d32; color:#8A93A0"
+    except Exception:
+        return ""
+
+
+def _color_high(val):
+    try:
+        v = float(val)
+        if v >= 0:      return "background-color:#1d5c3e; color:#E8E6DF"
+        elif v >= -2:   return "background-color:#3a6b2a; color:#E8E6DF"
+        elif v >= -5:   return "background-color:#7a6b1a; color:#E8E6DF"
+        elif v >= -10:  return "background-color:#7a3a1a; color:#E8E6DF"
+        else:           return "background-color:#5c2222; color:#8A93A0"
+    except Exception:
+        return ""
+
+
+def style_table(t_df: pd.DataFrame):
+    if t_df.empty:
+        return t_df
+    styled = t_df.style
+    if "Weekly Vol Ratio" in t_df.columns:
+        styled = styled.map(_color_vol, subset=["Weekly Vol Ratio"])
+    if "% From 20W High" in t_df.columns:
+        styled = styled.map(_color_high, subset=["% From 20W High"])
+    fmt = {}
+    for col, fmt_str in [
+        ("Close",                "{:.2f}"),
+        ("Compression (20d)",    "{:.2f}"),
+        ("% From 20W High",      "{:.2f}"),
+        ("Weekly Vol Ratio",     "{:.2f}"),
+        ("% Above Weekly EMA20", "{:.2f}"),
+        ("Daily Volume",         "{:,.0f}"),
+    ]:
+        if col in t_df.columns:
+            fmt[col] = fmt_str
+    return styled.format(fmt, na_rep="—")
+
+
+# ---------------------------------------------------------------------------
+# 6. UI
 # ---------------------------------------------------------------------------
 
 st.markdown(
@@ -380,37 +484,44 @@ with st.sidebar:
     )
     top_n = 1000
     if universe_choice.startswith("Top N"):
-        top_n = st.number_input("How many stocks (by market cap)", min_value=100, max_value=2000, value=1000, step=100)
+        top_n = st.number_input(
+            "How many stocks (by market cap)",
+            min_value=100, max_value=2000, value=1000, step=100,
+        )
         st.caption(
             "First run ranks ~2000 NSE stocks by market cap via live lookups — "
             "can take several minutes. Cached for 7 days after that."
         )
+
     uploaded = st.file_uploader(
         "Optional: upload your own symbol list (CSV with a Symbol column). "
-        "Overrides the live fetch above — useful if NSE blocks the automated request, "
-        "or if you already have a market-cap-ranked list.",
+        "Overrides the live fetch above.",
         type=["csv"],
     )
+
     max_limit = 2000 if universe_choice.startswith("Top N") else 500
-    limit = st.slider("Limit stocks scanned (for a faster test run)", 20, max_limit, min(100, max_limit), step=10)
+    limit = st.slider(
+        "Limit stocks scanned (lower = faster test run)",
+        20, max_limit, min(500, max_limit), step=10,
+    )
 
     st.header("Strict scan thresholds")
-    s_min_price = st.number_input("Strict: Min price", value=150, key="s_price")
-    s_min_vol = st.number_input("Strict: Min daily volume", value=500000, step=50000, key="s_vol")
-    s_compression = st.slider("Strict: Compression band (max/min open)", 1.00, 1.30, 1.10, 0.01, key="s_comp")
-    s_near_high = st.slider("Strict: Within % of 20W high", 0.5, 10.0, 2.0, 0.5, key="s_high")
-    s_vol_mult = st.slider("Strict: Weekly volume expansion (x avg)", 1.0, 3.0, 1.5, 0.1, key="s_volmult")
-    s_extension = st.slider("Strict: Max % above weekly EMA20", 2.0, 25.0, 10.0, 1.0, key="s_ext")
-    s_ema50_rising = st.checkbox("Strict: Require EMA50 rising", value=True, key="s_rising")
+    s_min_price   = st.number_input("Min price (₹)", value=150, key="s_price")
+    s_min_vol     = st.number_input("Min daily volume", value=500000, step=50000, key="s_vol")
+    s_compression = st.slider("Compression band (max/min open)", 1.00, 1.30, 1.10, 0.01, key="s_comp")
+    s_near_high   = st.slider("Within % of 20W high", 0.5, 10.0, 2.0, 0.5, key="s_high")
+    s_vol_mult    = st.slider("Weekly volume expansion (×avg)", 1.0, 3.0, 1.5, 0.1, key="s_volmult")
+    s_extension   = st.slider("Max % above weekly EMA20", 2.0, 25.0, 10.0, 1.0, key="s_ext")
+    s_ema50_rising = st.checkbox("Require EMA50 rising", value=True, key="s_rising")
 
-    st.header("Watchlist scan thresholds (looser)")
-    w_min_price = st.number_input("Watchlist: Min price", value=150, key="w_price")
-    w_min_vol = st.number_input("Watchlist: Min daily volume", value=500000, step=50000, key="w_vol")
-    w_compression = st.slider("Watchlist: Compression band", 1.00, 1.40, 1.15, 0.01, key="w_comp")
-    w_near_high = st.slider("Watchlist: Within % of 20W high", 0.5, 15.0, 5.0, 0.5, key="w_high")
-    w_vol_mult = st.slider("Watchlist: Weekly volume expansion (x avg)", 1.0, 3.0, 1.25, 0.1, key="w_volmult")
-    w_extension = st.slider("Watchlist: Max % above weekly EMA20", 2.0, 30.0, 15.0, 1.0, key="w_ext")
-    w_ema50_rising = st.checkbox("Watchlist: Require EMA50 rising", value=False, key="w_rising")
+    st.header("Watchlist thresholds (looser)")
+    w_min_price   = st.number_input("Min price (₹)", value=150, key="w_price")
+    w_min_vol     = st.number_input("Min daily volume", value=500000, step=50000, key="w_vol")
+    w_compression = st.slider("Compression band (max/min open)", 1.00, 1.40, 1.15, 0.01, key="w_comp")
+    w_near_high   = st.slider("Within % of 20W high", 0.5, 15.0, 5.0, 0.5, key="w_high")
+    w_vol_mult    = st.slider("Weekly volume expansion (×avg)", 1.0, 3.0, 1.25, 0.1, key="w_volmult")
+    w_extension   = st.slider("Max % above weekly EMA20", 2.0, 30.0, 15.0, 1.0, key="w_ext")
+    w_ema50_rising = st.checkbox("Require EMA50 rising", value=False, key="w_rising")
 
     run_button = st.button("🔍 Run Scan", type="primary", use_container_width=True)
 
@@ -428,64 +539,87 @@ params = {
 }
 
 if run_button:
+
+    # --- Resolve symbol list ---
     with st.spinner("Fetching stock universe..."):
-        if universe_choice.startswith("Top N"):
-            mc_status = st.empty()
-            symbols = get_topn_marketcap_list(uploaded, top_n, progress_placeholder=mc_status)
-            mc_status.empty()
+        if uploaded is not None:
+            symbols = symbols_from_upload(uploaded)
+            if universe_choice.startswith("Top N"):
+                symbols = symbols[:int(top_n)]
+        elif universe_choice.startswith("Top N"):
+            mc_msg = st.empty()
+            pool = fetch_full_nse_equity_list()
+            if pool:
+                mc_msg.info(
+                    f"Ranking {len(pool)} NSE stocks by market cap — "
+                    "takes a few minutes on first run, then cached 7 days."
+                )
+                symbols = rank_by_market_cap(tuple(pool), int(top_n))
+                mc_msg.empty()
+            else:
+                symbols = None
         else:
-            symbols = get_symbol_list(uploaded)
+            symbols = fetch_nifty500_symbols()
 
     if not symbols:
         st.error(
-            "Could not fetch the stock list from NSE (it often blocks scripted requests, "
-            "and market-cap ranking needs many live lookups). Please upload a CSV of symbols "
-            "using the sidebar uploader, then click Run Scan again. For Nifty 500, get the list from "
-            "https://www.niftyindices.com/indices/equity/broad-based-indices/nifty-500 — "
-            "for a market-cap-ranked list, any broker or screener export with a Symbol column works."
+            "Could not fetch the stock list from NSE — NSE often blocks automated requests. "
+            "Please download the Nifty 500 list from "
+            "https://www.niftyindices.com/indices/equity/broad-based-indices/nifty-500 "
+            "and upload the CSV via the sidebar."
         )
         st.stop()
 
     symbols = symbols[:limit]
-    status_msg = st.empty()
-    status_msg.info(f"Scanning {len(symbols)} stocks...")
 
-    progress = st.progress(0, text="Downloading daily data...")
-    daily_data = download_data(symbols, interval="1d", period="6mo")
-    progress.progress(50, text="Downloading weekly data...")
-    weekly_data = download_data(symbols, interval="1wk", period="2y")
-    progress.progress(80, text="Computing conditions...")
+    # --- Download data ---
+    progress = st.progress(0, text="Downloading daily data…")
+    daily_data  = download_data(tuple(symbols), interval="1d",  period="6mo")
+    progress.progress(50, text="Downloading weekly data…")
+    weekly_data = download_data(tuple(symbols), interval="1wk", period="2y")
+    progress.progress(85, text="Computing conditions…")
 
+    # --- Evaluate ---
     results = []
     for sym in symbols:
         row = evaluate_stock(sym, daily_data.get(sym), weekly_data.get(sym), params)
         if row:
             results.append(row)
-    progress.progress(100, text="Done")
-    time.sleep(0.3)
+    progress.progress(100, text="Done ✓")
+    time.sleep(0.4)
     progress.empty()
-    status_msg.empty()
 
     if not results:
-        st.warning("No data could be evaluated. Try uploading the CSV manually or reducing the stock limit.")
+        st.warning(
+            "No stocks could be evaluated — this usually means NSE data could not be "
+            "downloaded for any ticker. Try uploading a Nifty 500 CSV to bypass the live fetch."
+        )
         st.stop()
 
     df = pd.DataFrame(results)
 
-    strict_df = df[df["Pass Strict"]].drop(columns=["Pass Strict", "Pass Watchlist"]).sort_values(
-        "% From 20W High", ascending=False
+    strict_df = (
+        df[df["Pass Strict"]]
+        .drop(columns=["Pass Strict", "Pass Watchlist"])
+        .sort_values("% From 20W High", ascending=False)
+        .reset_index(drop=True)
     )
-    watchlist_df = df[df["Pass Watchlist"] & ~df["Pass Strict"]].drop(
-        columns=["Pass Strict", "Pass Watchlist"]
-    ).sort_values("% From 20W High", ascending=False)
+    watchlist_df = (
+        df[df["Pass Watchlist"] & ~df["Pass Strict"]]
+        .drop(columns=["Pass Strict", "Pass Watchlist"])
+        .sort_values("% From 20W High", ascending=False)
+        .reset_index(drop=True)
+    )
 
-    now_str = pd.Timestamp.now().strftime("%d %b %Y, %H:%M")
+    # IST timestamp — accurate regardless of server timezone
+    now_ist = pd.Timestamp.now(tz=IST).strftime("%d %b %Y, %H:%M IST")
+
     st.markdown(
         f"""
         <div class="ticker-board">
             <div class="ticker-cell">
                 <div class="label">Scanned</div>
-                <div class="value">{len(symbols)}</div>
+                <div class="value">{len(results)}</div>
             </div>
             <div class="ticker-cell">
                 <div class="label">Strict Hits</div>
@@ -496,85 +630,42 @@ if run_button:
                 <div class="value bull">{len(watchlist_df)}</div>
             </div>
             <div class="ticker-cell">
-                <div class="label">Last Run</div>
-                <div class="value" style="font-size:1.05rem;">{now_str}</div>
+                <div class="label">Last Run (IST)</div>
+                <div class="value" style="font-size:0.95rem;">{now_ist}</div>
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    def _color_vol(val):
-        """Green shading for volume ratio — no matplotlib needed."""
-        try:
-            v = float(val)
-            if v >= 2.5:   return "background-color:#1a4d35; color:#E8E6DF"
-            elif v >= 2.0: return "background-color:#1d5c3e; color:#E8E6DF"
-            elif v >= 1.5: return "background-color:#236b48; color:#E8E6DF"
-            elif v >= 1.25:return "background-color:#2a7a52; color:#E8E6DF"
-            else:          return "background-color:#2a3d32; color:#8A93A0"
-        except Exception:
-            return ""
-
-    def _color_high(val):
-        """RdYlGn shading for % from 20W high — no matplotlib needed."""
-        try:
-            v = float(val)
-            if v >= 0:     return "background-color:#1d5c3e; color:#E8E6DF"   # above/at high — bullish
-            elif v >= -2:  return "background-color:#3a6b2a; color:#E8E6DF"   # within 2% — near breakout
-            elif v >= -5:  return "background-color:#7a6b1a; color:#E8E6DF"   # 2-5% below
-            elif v >= -10: return "background-color:#7a3a1a; color:#E8E6DF"   # 5-10% below
-            else:          return "background-color:#5c2222; color:#8A93A0"   # far below
-        except Exception:
-            return ""
-
-    def style_table(t_df):
-        """Color-code key signal columns — pure pandas, no matplotlib required."""
-        if t_df.empty:
-            return t_df
-        styled = t_df.style
-        if "Weekly Vol Ratio" in t_df.columns:
-            styled = styled.map(_color_vol, subset=["Weekly Vol Ratio"])
-        if "% From 20W High" in t_df.columns:
-            styled = styled.map(_color_high, subset=["% From 20W High"])
-        fmt = {}
-        for col, fmt_str in [
-            ("Close", "{:.2f}"),
-            ("Compression (20d)", "{:.2f}"),
-            ("% From 20W High", "{:.2f}"),
-            ("Weekly Vol Ratio", "{:.2f}"),
-            ("% Above Weekly EMA20", "{:.2f}"),
-            ("Daily Volume", "{:,.0f}"),
-        ]:
-            if col in t_df.columns:
-                fmt[col] = fmt_str
-        return styled.format(fmt)
-
     st.markdown('<div class="section-label">STRICT BREAKOUT LIST</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="section-sub">Near/at breakout, confirmed by weekly volume expansion. Highest conviction.</div>',
+        '<div class="section-sub">Near/at breakout · weekly volume confirmed · highest conviction</div>',
         unsafe_allow_html=True,
     )
     if strict_df.empty:
-        st.markdown("`empty — no stock currently meets every strict condition`")
+        st.markdown("`No stocks meet every strict condition right now — check back on Friday/Saturday.`")
     else:
         st.dataframe(style_table(strict_df), use_container_width=True, hide_index=True)
 
     st.markdown('<div class="section-label">WATCHLIST</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="section-sub">Setting up but not yet meeting the strict criteria — track these for next week.</div>',
+        '<div class="section-sub">Setting up but not yet at the trigger — track these for next week</div>',
         unsafe_allow_html=True,
     )
     if watchlist_df.empty:
-        st.markdown("`empty — nothing setting up right now`")
+        st.markdown("`Nothing setting up right now.`")
     else:
         st.dataframe(style_table(watchlist_df), use_container_width=True, hide_index=True)
 
-    with st.expander("Show full scan data (all evaluated stocks, pass/fail included)"):
+    with st.expander("Show full scan data (all stocks, pass/fail columns included)"):
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download full results as CSV", csv, "scan_results.csv", "text/csv")
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇ Download full results as CSV",
+        csv_bytes, "scan_results.csv", "text/csv",
+    )
 
 else:
-    st.info("Set your thresholds in the sidebar, then click **Run Scan**.")
+    st.info("Configure thresholds in the sidebar, then click **Run Scan**.")
