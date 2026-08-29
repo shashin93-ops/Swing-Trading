@@ -271,84 +271,109 @@ def _ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 
+def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+    """Average True Range — measures real volatility including gaps."""
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
 def _last_closed_weekly(weekly: pd.DataFrame) -> pd.DataFrame:
-    """
-    Drop the current in-progress week so partial candles don't skew results.
-    Works correctly whether the index is tz-aware or tz-naive.
-    """
+    """Drop the current in-progress week (partial candle)."""
     now_ist = pd.Timestamp.now(tz=IST)
     this_monday_ist = (now_ist - pd.Timedelta(days=now_ist.weekday())).normalize()
-
     idx = weekly.index
     if idx.tzinfo is not None or (hasattr(idx, "tz") and idx.tz is not None):
-        this_monday = this_monday_ist. astimezone(idx.tz)
+        this_monday = this_monday_ist.astimezone(idx.tz)
     else:
         this_monday = this_monday_ist.replace(tzinfo=None)
-
     if weekly.index[-1] >= this_monday:
         weekly = weekly.iloc[:-1]
     return weekly
 
 
 def _last_closed_daily(daily: pd.DataFrame) -> pd.DataFrame:
-    """
-    Drop today's partial daily bar if the NSE market hasn't fully closed yet
-    (NSE closes 15:30 IST; add a 15-min buffer → 15:45 IST).
-    """
+    """Drop today's bar if NSE hasn't closed yet (15:45 IST buffer)."""
     now_ist = pd.Timestamp.now(tz=IST)
     market_close_ist = now_ist.normalize().replace(hour=15, minute=45)
-
     idx = daily.index
     if idx.tzinfo is not None or (hasattr(idx, "tz") and idx.tz is not None):
         today_start = now_ist.normalize().astimezone(idx.tz)
     else:
         today_start = now_ist.normalize().replace(tzinfo=None)
-
     if now_ist < market_close_ist and daily.index[-1] >= today_start:
         daily = daily.iloc[:-1]
     return daily
 
 
 # ---------------------------------------------------------------------------
-# 4. STOCK EVALUATION
+# 4. STOCK EVALUATION  (price-action grade)
 # ---------------------------------------------------------------------------
 
 def evaluate_stock(symbol: str, daily: pd.DataFrame, weekly: pd.DataFrame, params: dict):
     """
-    Returns a metrics dict (with Pass Strict / Pass Watchlist flags),
-    or None if data is insufficient.
+    Price-action-grade evaluation. Computes:
+
+    TREND (weekly)
+      • Close > EMA20 > EMA50, EMA50 slope rising
+
+    CONSOLIDATION QUALITY (daily, last 20 days)
+      • ATR compression: 10d ATR / 50d ATR < threshold  (tight = contracting volatility)
+      • Higher-low structure: lowest low of last 10d > lowest low of prior 10d
+
+    BREAKOUT PROXIMITY (weekly)
+      • Within N% of prior 20-week high
+      • Within N% of 52-week high
+
+    CANDLE QUALITY (last weekly candle)
+      • Close in upper 40%+ of the weekly candle range (not a rejection/wick candle)
+
+    VOLUME EXPANSION (weekly)
+      • This week's volume > X × 10-week median (median is more robust than mean — ignores prior spikes)
+
+    EXTENSION GUARD
+      • Close not more than N% above weekly EMA20
+
+    Returns a dict with all metrics + Pass Strict / Pass Watchlist flags, or None.
     """
     if daily is None or weekly is None:
         return None
 
-    # Remove partial candles
     weekly = _last_closed_weekly(weekly)
     daily  = _last_closed_daily(daily)
 
-    if len(daily) < 22 or len(weekly) < 55:
+    # 60 daily bars covers ATR50 + buffer; 55 weekly bars covers EMA50
+    if len(daily) < 60 or len(weekly) < 55:
         return None
 
     try:
-        d_close = daily["Close"].squeeze()
-        d_open  = daily["Open"].squeeze()
-        d_vol   = daily["Volume"].squeeze()
-        w_close = weekly["Close"].squeeze()
-        w_high  = weekly["High"].squeeze()
-        w_vol   = weekly["Volume"].squeeze()
+        d_close  = daily["Close"].squeeze()
+        d_open   = daily["Open"].squeeze()
+        d_high   = daily["High"].squeeze()
+        d_low    = daily["Low"].squeeze()
+        d_vol    = daily["Volume"].squeeze()
+        w_close  = weekly["Close"].squeeze()
+        w_open   = weekly["Open"].squeeze()
+        w_high   = weekly["High"].squeeze()
+        w_low    = weekly["Low"].squeeze()
+        w_vol    = weekly["Volume"].squeeze()
 
-        # Sanity check — must be a Series after squeeze
-        for s in (d_close, d_open, d_vol, w_close, w_high, w_vol):
+        for s in (d_close, d_open, d_high, d_low, d_vol,
+                  w_close, w_open, w_high, w_low, w_vol):
             if not isinstance(s, pd.Series):
                 return None
 
         latest_close = float(d_close.iloc[-1])
         latest_vol   = float(d_vol.iloc[-1])
 
-        # Guard against NaN close
         if np.isnan(latest_close) or latest_close <= 0:
             return None
 
-        # Weekly trend
+        # ── WEEKLY TREND ──────────────────────────────────────────────────
         w_ema20 = _ema(w_close, 20)
         w_ema50 = _ema(w_close, 50)
         weekly_trend_ok = (
@@ -357,48 +382,117 @@ def evaluate_stock(symbol: str, daily: pd.DataFrame, weekly: pd.DataFrame, param
         )
         ema50_rising = float(w_ema50.iloc[-1]) > float(w_ema50.iloc[-2])
 
-        # Daily 20-day open compression
-        last20_open = d_open.iloc[-20:]
-        mn, mx = float(last20_open.min()), float(last20_open.max())
-        compression_ratio = mx / mn if mn > 0 else np.nan
+        # ── ATR COMPRESSION (daily) ───────────────────────────────────────
+        # 10d ATR / 50d ATR — ratio < 1 means current volatility is
+        # contracting vs longer history. Good base = ratio < ~0.75.
+        d_atr10 = _atr(d_high, d_low, d_close, 10)
+        d_atr50 = _atr(d_high, d_low, d_close, 50)
+        atr10_val = float(d_atr10.iloc[-1])
+        atr50_val = float(d_atr50.iloc[-1])
+        atr_compression = atr10_val / atr50_val if atr50_val > 0 else np.nan
 
-        # Proximity to prior 20-week high (exclude current week)
-        prior_slice  = w_high.iloc[-21:-1]
-        prior_20w_hi = float(prior_slice.max())
-        pct_from_high = (float(w_close.iloc[-1]) / prior_20w_hi - 1) * 100 if prior_20w_hi > 0 else np.nan
+        # ── HIGHER-LOW STRUCTURE (daily) ──────────────────────────────────
+        # Genuine accumulation = 3 ascending 10-day low windows (a staircase).
+        # One window comparison is too easily faked by a single gap-up day.
+        # All three windows must be ascending: window3 > window2 > window1.
+        low_w1 = float(d_low.iloc[-30:-20].min())  # oldest
+        low_w2 = float(d_low.iloc[-20:-10].min())  # middle
+        low_w3 = float(d_low.iloc[-10:].min())     # most recent
+        higher_lows = (low_w3 > low_w2) and (low_w2 > low_w1)
 
-        # Weekly volume expansion vs prior 20 weeks
-        vol_slice    = w_vol.iloc[-21:-1]
-        w_vol_avg20  = float(vol_slice.mean())
-        vol_ratio    = float(w_vol.iloc[-1]) / w_vol_avg20 if w_vol_avg20 > 0 else np.nan
+        # ── BREAKOUT PROXIMITY ────────────────────────────────────────────
+        # Prior 20-week high (excluding current week)
+        prior_20w_hi = float(w_high.iloc[-21:-1].max())
+        pct_from_20w_high = (
+            (float(w_close.iloc[-1]) / prior_20w_hi - 1) * 100
+            if prior_20w_hi > 0 else np.nan
+        )
 
-        # Extension above weekly EMA20
+        # 52-week high proximity (using daily data — more granular)
+        high_52w = float(d_high.iloc[-252:].max()) if len(d_high) >= 252 else float(d_high.max())
+        pct_from_52w_high = (latest_close / high_52w - 1) * 100 if high_52w > 0 else np.nan
+
+        # ── WEEKLY CANDLE QUALITY ─────────────────────────────────────────
+        # Close position within the weekly range.
+        # 1.0 = closed at the very top, 0.0 = closed at the very bottom.
+        # Require ≥ 0.4 to filter out rejection/wick candles.
+        w_range = float(w_high.iloc[-1]) - float(w_low.iloc[-1])
+        if w_range > 0:
+            weekly_close_position = (float(w_close.iloc[-1]) - float(w_low.iloc[-1])) / w_range
+        else:
+            weekly_close_position = 0.5
+
+        # ── WEEKLY VOLUME EXPANSION ───────────────────────────────────────
+        # Use 10-week MEDIAN of prior weeks (more robust than mean — ignores
+        # prior spike weeks that inflate the average and hide real expansion).
+        prior_10w_vol_median = float(w_vol.iloc[-11:-1].median())
+        vol_ratio = (
+            float(w_vol.iloc[-1]) / prior_10w_vol_median
+            if prior_10w_vol_median > 0 else np.nan
+        )
+
+        # ── EXTENSION GUARD ───────────────────────────────────────────────
         pct_above_ema20 = (float(w_close.iloc[-1]) / float(w_ema20.iloc[-1]) - 1) * 100
 
+        # ── RELATIVE STRENGTH vs NIFTY 50 (12-week, display only) ────────
+        # RS = stock 12W return / Nifty50 12W return.
+        # > 1.0 = outperforming index. We pass nifty_close via params.
+        rs_12w = None
+        try:
+            nifty = params.get("nifty_weekly")
+            if nifty is not None and len(nifty) >= 13:
+                nifty_now  = float(nifty.iloc[-1])
+                nifty_12w  = float(nifty.iloc[-13])
+                stock_now  = float(w_close.iloc[-1])
+                stock_12w  = float(w_close.iloc[-13])
+                if nifty_12w > 0 and stock_12w > 0:
+                    stock_ret  = stock_now / stock_12w
+                    nifty_ret  = nifty_now / nifty_12w
+                    rs_12w     = round(stock_ret / nifty_ret, 2)
+        except Exception:
+            rs_12w = None
+
+        # ── BUILD ROW ─────────────────────────────────────────────────────
         row = {
-            "Symbol":               symbol.replace(".NS", ""),
-            "Close":                round(latest_close, 2),
-            "Weekly Trend OK":      weekly_trend_ok,
-            "EMA50 Rising":         ema50_rising,
-            "Compression (20d)":    round((compression_ratio - 1) * 100, 2) if not np.isnan(compression_ratio) else None,
-            "% From 20W High":      round(pct_from_high, 2) if not np.isnan(pct_from_high) else None,
-            "Weekly Vol Ratio":     round(vol_ratio, 2) if not np.isnan(vol_ratio) else None,
-            "% Above Weekly EMA20": round(pct_above_ema20, 2),
-            "Daily Volume":         int(latest_vol),
+            "Symbol":                symbol.replace(".NS", ""),
+            "Close":                 round(latest_close, 2),
+            # Trend
+            "Weekly Trend":          weekly_trend_ok,
+            "EMA50 Rising":          ema50_rising,
+            "RS vs Nifty (12W)":     rs_12w,
+            # Consolidation quality
+            "ATR Compression":       round(atr_compression, 2) if not np.isnan(atr_compression) else None,
+            "Higher Lows (3W)":      higher_lows,
+            # Breakout proximity
+            "% From 20W High":       round(pct_from_20w_high, 2) if not np.isnan(pct_from_20w_high) else None,
+            "% From 52W High":       round(pct_from_52w_high, 2) if not np.isnan(pct_from_52w_high) else None,
+            # Candle quality
+            "Wkly Close Position":   round(weekly_close_position, 2),
+            # Volume
+            "Weekly Vol Ratio":      round(vol_ratio, 2) if not np.isnan(vol_ratio) else None,
+            # Extension guard
+            "% Above EMA20":         round(pct_above_ema20, 2),
+            # Liquidity
+            "Daily Volume":          int(latest_vol),
         }
 
-        # Evaluate pass conditions for both profiles
+        # ── PASS FLAGS ────────────────────────────────────────────────────
         for label, p in [("Strict", params["strict"]), ("Watchlist", params["watchlist"])]:
-            vol_ok  = (row["Weekly Vol Ratio"] is not None and row["Weekly Vol Ratio"] >= p["vol_multiple"])
-            high_ok = (row["% From 20W High"] is not None and row["% From 20W High"] >= -p["near_high_pct"])
-            comp_ok = (row["Compression (20d)"] is not None and (row["Compression (20d)"] / 100 + 1) <= p["compression_band"])
+            vol_ok      = row["Weekly Vol Ratio"]   is not None and row["Weekly Vol Ratio"]   >= p["vol_multiple"]
+            high_20w_ok = row["% From 20W High"]    is not None and row["% From 20W High"]    >= -p["near_high_pct"]
+            high_52w_ok = row["% From 52W High"]    is not None and row["% From 52W High"]    >= -p["near_52w_pct"]
+            atr_ok      = row["ATR Compression"]    is not None and row["ATR Compression"]    <= p["atr_compression"]
+            candle_ok   = row["Wkly Close Position"]                                          >= p["min_close_position"]
             passes = (
-                latest_vol   >= p["min_volume"]
+                latest_vol       >= p["min_volume"]
                 and latest_close >= p["min_price"]
                 and weekly_trend_ok
-                and (ema50_rising or not p["require_ema50_rising"])
-                and comp_ok
-                and high_ok
+                and (ema50_rising    or not p["require_ema50_rising"])
+                and atr_ok
+                and (higher_lows    or not p["require_higher_lows"])
+                and high_20w_ok
+                and high_52w_ok
+                and candle_ok
                 and vol_ok
                 and pct_above_ema20 <= p["extension_cap"]
             )
@@ -438,22 +532,67 @@ def _color_high(val):
         return ""
 
 
+def _color_atr(val):
+    """Green = tight (good base), red = wide (volatile/extended)."""
+    try:
+        v = float(val)
+        if v <= 0.60:   return "background-color:#1a4d35; color:#E8E6DF"
+        elif v <= 0.75: return "background-color:#236b48; color:#E8E6DF"
+        elif v <= 0.90: return "background-color:#7a6b1a; color:#E8E6DF"
+        else:           return "background-color:#5c2222; color:#8A93A0"
+    except Exception:
+        return ""
+
+
+def _color_close_pos(val):
+    """Green = closed near top of range (bullish), red = closed near bottom (rejection)."""
+    try:
+        v = float(val)
+        if v >= 0.7:    return "background-color:#1d5c3e; color:#E8E6DF"
+        elif v >= 0.5:  return "background-color:#3a6b2a; color:#E8E6DF"
+        elif v >= 0.35: return "background-color:#7a6b1a; color:#E8E6DF"
+        else:           return "background-color:#5c2222; color:#8A93A0"
+    except Exception:
+        return ""
+
+
+def _color_rs(val):
+    """Green = outperforming Nifty, red = underperforming."""
+    try:
+        v = float(val)
+        if v >= 1.20:   return "background-color:#1a4d35; color:#E8E6DF"
+        elif v >= 1.05: return "background-color:#236b48; color:#E8E6DF"
+        elif v >= 0.95: return "background-color:#7a6b1a; color:#E8E6DF"
+        else:           return "background-color:#5c2222; color:#8A93A0"
+    except Exception:
+        return ""
+
+
 def style_table(t_df: pd.DataFrame):
     if t_df.empty:
         return t_df
     styled = t_df.style
-    if "Weekly Vol Ratio" in t_df.columns:
-        styled = styled.map(_color_vol, subset=["Weekly Vol Ratio"])
-    if "% From 20W High" in t_df.columns:
-        styled = styled.map(_color_high, subset=["% From 20W High"])
+    for col, fn in [
+        ("Weekly Vol Ratio",    _color_vol),
+        ("% From 20W High",     _color_high),
+        ("% From 52W High",     _color_high),
+        ("ATR Compression",     _color_atr),
+        ("Wkly Close Position", _color_close_pos),
+        ("RS vs Nifty (12W)",   _color_rs),
+    ]:
+        if col in t_df.columns:
+            styled = styled.map(fn, subset=[col])
     fmt = {}
     for col, fmt_str in [
-        ("Close",                "{:.2f}"),
-        ("Compression (20d)",    "{:.2f}"),
-        ("% From 20W High",      "{:.2f}"),
-        ("Weekly Vol Ratio",     "{:.2f}"),
-        ("% Above Weekly EMA20", "{:.2f}"),
-        ("Daily Volume",         "{:,.0f}"),
+        ("Close",               "{:.2f}"),
+        ("ATR Compression",     "{:.2f}"),
+        ("% From 20W High",     "{:.2f}"),
+        ("% From 52W High",     "{:.2f}"),
+        ("Wkly Close Position", "{:.2f}"),
+        ("Weekly Vol Ratio",    "{:.2f}"),
+        ("RS vs Nifty (12W)",   "{:.2f}"),
+        ("% Above EMA20",       "{:.2f}"),
+        ("Daily Volume",        "{:,.0f}"),
     ]:
         if col in t_df.columns:
             fmt[col] = fmt_str
@@ -506,35 +645,51 @@ with st.sidebar:
     )
 
     st.header("Strict scan thresholds")
-    s_min_price   = st.number_input("Min price (₹)", value=150, key="s_price")
-    s_min_vol     = st.number_input("Min daily volume", value=500000, step=50000, key="s_vol")
-    s_compression = st.slider("Compression band (max/min open)", 1.00, 1.30, 1.10, 0.01, key="s_comp")
-    s_near_high   = st.slider("Within % of 20W high", 0.5, 10.0, 2.0, 0.5, key="s_high")
-    s_vol_mult    = st.slider("Weekly volume expansion (×avg)", 1.0, 3.0, 1.5, 0.1, key="s_volmult")
-    s_extension   = st.slider("Max % above weekly EMA20", 2.0, 25.0, 10.0, 1.0, key="s_ext")
-    s_ema50_rising = st.checkbox("Require EMA50 rising", value=True, key="s_rising")
+    s_min_price       = st.number_input("Min price (₹)", value=150, key="s_price")
+    s_min_vol         = st.number_input("Min daily volume", value=500000, step=50000, key="s_vol")
+    s_atr_compression = st.slider("ATR compression (10d÷50d, lower = tighter base)", 0.40, 1.20, 0.80, 0.05, key="s_atr",
+                                   help="Ratio of short-term to long-term ATR. <0.75 = very tight base. 0.80 is a good default.")
+    s_near_high       = st.slider("Within % of 20W high", 0.5, 10.0, 3.0, 0.5, key="s_high")
+    s_near_52w        = st.slider("Within % of 52W high", 1.0, 40.0, 20.0, 1.0, key="s_52w",
+                                   help="Stock must be near its 52-week high — ensures real momentum, not a dead-cat bounce.")
+    s_vol_mult        = st.slider("Weekly vol expansion (×10W median)", 1.0, 3.0, 1.5, 0.1, key="s_volmult")
+    s_close_pos       = st.slider("Min weekly close position (0=bottom, 1=top)", 0.0, 1.0, 0.40, 0.05, key="s_cpos",
+                                   help="Filters out rejection/wick candles. 0.4 = close must be in upper 60% of the weekly range.")
+    s_extension       = st.slider("Max % above weekly EMA20", 2.0, 25.0, 10.0, 1.0, key="s_ext")
+    s_ema50_rising    = st.checkbox("Require EMA50 rising", value=True, key="s_rising")
+    s_higher_lows     = st.checkbox("Require higher lows (accumulation structure)", value=True, key="s_hl",
+                                     help="Last 10d lowest low > prior 10d lowest low — confirms accumulation, not distribution.")
 
     st.header("Watchlist thresholds (looser)")
-    w_min_price   = st.number_input("Min price (₹)", value=150, key="w_price")
-    w_min_vol     = st.number_input("Min daily volume", value=500000, step=50000, key="w_vol")
-    w_compression = st.slider("Compression band (max/min open)", 1.00, 1.40, 1.15, 0.01, key="w_comp")
-    w_near_high   = st.slider("Within % of 20W high", 0.5, 15.0, 5.0, 0.5, key="w_high")
-    w_vol_mult    = st.slider("Weekly volume expansion (×avg)", 1.0, 3.0, 1.25, 0.1, key="w_volmult")
-    w_extension   = st.slider("Max % above weekly EMA20", 2.0, 30.0, 15.0, 1.0, key="w_ext")
-    w_ema50_rising = st.checkbox("Require EMA50 rising", value=False, key="w_rising")
+    w_min_price       = st.number_input("Min price (₹)", value=150, key="w_price")
+    w_min_vol         = st.number_input("Min daily volume", value=500000, step=50000, key="w_vol")
+    w_atr_compression = st.slider("ATR compression (10d÷50d)", 0.40, 1.40, 1.00, 0.05, key="w_atr")
+    w_near_high       = st.slider("Within % of 20W high", 0.5, 15.0, 7.0, 0.5, key="w_high")
+    w_near_52w        = st.slider("Within % of 52W high", 1.0, 50.0, 35.0, 1.0, key="w_52w")
+    w_vol_mult        = st.slider("Weekly vol expansion (×10W median)", 1.0, 3.0, 1.25, 0.1, key="w_volmult")
+    w_close_pos       = st.slider("Min weekly close position", 0.0, 1.0, 0.30, 0.05, key="w_cpos")
+    w_extension       = st.slider("Max % above weekly EMA20", 2.0, 30.0, 15.0, 1.0, key="w_ext")
+    w_ema50_rising    = st.checkbox("Require EMA50 rising", value=False, key="w_rising")
+    w_higher_lows     = st.checkbox("Require higher lows", value=False, key="w_hl")
 
     run_button = st.button("🔍 Run Scan", type="primary", use_container_width=True)
 
 params = {
     "strict": dict(
-        min_price=s_min_price, min_volume=s_min_vol, compression_band=s_compression,
-        near_high_pct=s_near_high, vol_multiple=s_vol_mult, extension_cap=s_extension,
-        require_ema50_rising=s_ema50_rising,
+        min_price=s_min_price, min_volume=s_min_vol,
+        atr_compression=s_atr_compression,
+        near_high_pct=s_near_high, near_52w_pct=s_near_52w,
+        vol_multiple=s_vol_mult, min_close_position=s_close_pos,
+        extension_cap=s_extension,
+        require_ema50_rising=s_ema50_rising, require_higher_lows=s_higher_lows,
     ),
     "watchlist": dict(
-        min_price=w_min_price, min_volume=w_min_vol, compression_band=w_compression,
-        near_high_pct=w_near_high, vol_multiple=w_vol_mult, extension_cap=w_extension,
-        require_ema50_rising=w_ema50_rising,
+        min_price=w_min_price, min_volume=w_min_vol,
+        atr_compression=w_atr_compression,
+        near_high_pct=w_near_high, near_52w_pct=w_near_52w,
+        vol_multiple=w_vol_mult, min_close_position=w_close_pos,
+        extension_cap=w_extension,
+        require_ema50_rising=w_ema50_rising, require_higher_lows=w_higher_lows,
     ),
 }
 
@@ -573,11 +728,30 @@ if run_button:
     symbols = symbols[:limit]
 
     # --- Download data ---
-    progress = st.progress(0, text="Downloading daily data…")
-    daily_data  = download_data(tuple(symbols), interval="1d",  period="6mo")
-    progress.progress(50, text="Downloading weekly data…")
+    progress = st.progress(0, text="Downloading Nifty 50 benchmark…")
+    nifty_weekly_close = None
+    try:
+        nifty_raw = yf.download(
+            "^NSEI", period="2y", interval="1wk",
+            progress=False, auto_adjust=True,
+        )
+        if not nifty_raw.empty:
+            nc = nifty_raw["Close"].squeeze()
+            if isinstance(nc, pd.Series):
+                nifty_weekly_close = _last_closed_weekly(
+                    nifty_raw[["Close"]]
+                )["Close"].squeeze()
+    except Exception:
+        nifty_weekly_close = None
+
+    progress.progress(10, text="Downloading daily data…")
+    daily_data  = download_data(tuple(symbols), interval="1d",  period="1y")
+    progress.progress(55, text="Downloading weekly data…")
     weekly_data = download_data(tuple(symbols), interval="1wk", period="2y")
     progress.progress(85, text="Computing conditions…")
+
+    # Inject Nifty benchmark into params so evaluate_stock can compute RS
+    params["nifty_weekly"] = nifty_weekly_close
 
     # --- Evaluate ---
     results = []
